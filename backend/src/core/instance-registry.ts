@@ -40,10 +40,27 @@ export class ServiceNowInstanceRegistry {
       const instancesEnv = process.env.SERVICENOW_INSTANCES;
       console.log(`[REGISTRY-INIT] SERVICENOW_INSTANCES=${instancesEnv || '(not set)'}`);
 
-      // Parse configured instances (e.g., "instance_001,instance_002")
-      const instanceIds = instancesEnv
-        ? instancesEnv.split(',').map(id => id.trim()).filter(id => id)
-        : [this.defaultInstanceId];
+      let instanceIds: string[] = [];
+      if (instancesEnv) {
+        instanceIds = instancesEnv.split(',').map(id => id.trim()).filter(id => id);
+      } else {
+        // Auto-discover instances from environment variables like SERVICENOW_INSTANCE_001_URL, SERVICENOW_INSTANCE_001_PASSWORD, etc.
+        const discovered = new Set<string>();
+        for (const key of Object.keys(process.env)) {
+          const match = key.match(/^SERVICENOW_INSTANCE_([A-Za-z0-9]+)_(URL|KEY|PASSWORD|USERNAME)$/i);
+          if (match) {
+            const rawId = match[1];
+            const id = /^instance_/i.test(rawId) ? rawId.toLowerCase() : `instance_${rawId.toLowerCase()}`;
+            discovered.add(id);
+          }
+        }
+        if (discovered.size > 0) {
+          instanceIds = Array.from(discovered).sort();
+          console.log(`[REGISTRY-INIT] Auto-discovered instances from environment variables: ${JSON.stringify(instanceIds)}`);
+        } else {
+          instanceIds = [this.defaultInstanceId];
+        }
+      }
 
       console.log(`[REGISTRY-INIT] Parsed instance IDs: ${JSON.stringify(instanceIds)}`);
 

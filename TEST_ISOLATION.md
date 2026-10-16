@@ -8,12 +8,12 @@ SERVICENOW_INSTANCES=instance_001,instance_002
 Instance 001:
   URL: https://dev192667.service-now.com/
   Username: admin
-  Password: og%39hZNG+kR
+  Password: [REDACTED_PASSWORD]
 
 Instance 002:
   URL: https://dev299604.service-now.com/
   Username: Inte2
-  Password: Wissda@123
+  Password: [REDACTED_PASSWORD]
 ```
 
 ---
@@ -317,8 +317,8 @@ If tests fail:
 
 2. **Verify ServiceNow instances are accessible:**
    ```bash
-   curl -u admin:og%39hZNG+kR https://dev192667.service-now.com/
-   curl -u Inte2:Wissda@123 https://dev299604.service-now.com/
+   curl -u admin:[REDACTED_PASSWORD] https://dev192667.service-now.com/
+   curl -u Inte2:[REDACTED_PASSWORD] https://dev299604.service-now.com/
    ```
 
 3. **Check backend logs for [ISOLATION] tags:**

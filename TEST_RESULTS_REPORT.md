@@ -74,11 +74,11 @@ SERVICENOW_INSTANCES=instance_001,instance_002
 
 Instance 001:
   URL: https://dev192667.service-now.com/
-  Credentials: admin / og%39hZNG+kR
+  Credentials: admin / [REDACTED_PASSWORD]
 
 Instance 002:
   URL: https://dev299604.service-now.com/
-  Credentials: Inte2 / Wissda@123
+  Credentials: Inte2 / [REDACTED_PASSWORD]
 ```
 
 ✅ Configuration is valid and will work once the code executes.
