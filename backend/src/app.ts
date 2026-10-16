@@ -1,0 +1,1141 @@
+console.log('[START] app.ts is loading...');
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import axios from 'axios';
+import path from 'path';
+import fs from 'fs';
+
+// Load .env file explicitly
+const envPath = path.resolve(__dirname, '../.env');
+const result = dotenv.config({ path: envPath });
+
+// FALLBACK: If env vars aren't loaded, read .env file manually
+if (!process.env.SERVICENOW_INSTANCE_002_URL && fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, 'utf-8');
+  envContent.split('\n').forEach(line => {
+    const [key, value] = line.split('=');
+    if (key && value && !process.env[key]) {
+      process.env[key] = value.trim().replace(/^["']|["']$/g, '');
+    }
+  });
+  console.log(`[FALLBACK] Manually loaded env vars from .env file`);
+}
+import { ServiceNowAdapter } from './adapters/servicenow';
+import { SalesforceAdapter } from './adapters/salesforce';
+import { DynamicAdapter } from './adapters/dynamic_adapter';
+import { SalesforceDescribeConnector } from './adapters/connectors/salesforce_describe';
+import { GeminiLLMClient, GroqLLMClient, DeepInfraLLMClient } from './llm/llm_client';
+import { GeminiEmbeddingsClient } from './llm/embeddings_client';
+import { VectorStore } from './core/vector_store';
+import { UniversalSchemaDiscoveryAgent } from './core/universal_schema_discovery_agent';
+import { listAllAdapterConfigs, GeneratedAdapterConfig } from './core/generated_adapter_config';
+import {
+  ControlEffectivenessAgent,
+  InherentAssessmentAgent,
+  RiskControlMappingAgent,
+  IssueIdentificationAgent,
+  AuthorityDocumentCitationAgent,
+  CitationRiskMappingAgent,
+  ObligationControlObjectiveMappingAgent
+} from './core/agents';
+import { withTrace, currentTrace, recentTraces, computeStats } from './core/observability';
+import { runIntegrityScan } from './core/integrity_scan';
+import { VerificationAgent } from './core/verification_agent';
+import { instanceRegistry } from './core/instance-registry';
+import { obsService } from './core/instance-observability';
+import { cacheService } from './core/instance-cache';
+import { waitUntil } from '@vercel/functions';
+import multer from 'multer';
+import { processExcelMapping } from './services/excel_mapping_service';
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+console.log('[DEBUG] Multi-instance services imported successfully');
+console.log(`[DEBUG] Instance Registry initialized with instances: ${instanceRegistry.getValidInstances().join(', ')}`);
+
+// Extend Express Request type for instance context
+declare global {
+  namespace Express {
+    interface Request {
+      instanceId: string;
+      obsService: typeof obsService;
+      cacheService: typeof cacheService;
+    }
+  }
+}
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
+// Support Netlify Functions path rewriting (/.netlify/functions/api -> /api)
+app.use((req, res, next) => {
+  if (req.url.startsWith('/.netlify/functions/api')) {
+    req.url = req.url.replace(/^\/\.netlify\/functions\/api/, '/api');
+  }
+  next();
+});
+
+// ============================================================================
+// LOUD inbound request logger — especially valuable when ServiceNow Script Includes
+// hit the wrong endpoint or method (HTTP 405 is #1 cause of "button does
+// nothing" failures). Logs EVERY /api/* call *before* any other middleware so
+// we can see a 405/404 even if isolation or routing rejects it.
+// ============================================================================
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    console.log(
+      `[INBOUND] ${req.method} ${req.path} ` +
+      `| Content-Type: ${req.get('Content-Type') || '(none)'} ` +
+      `| Content-Length: ${req.get('Content-Length') || '0'} ` +
+      `| Origin: ${req.get('Origin') || '(none'}`
+    );
+  }
+  next();
+});
+
+// Disable caching for all API requests to ensure fresh filtered data
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
+
+// ============================================================================
+// Static Frontend Serving
+// ============================================================================
+// Serve the frontend HTML/CSS/JS from the /frontend directory so the whole
+// app (frontend + API) works on a single localhost:3000 origin.
+const frontendDir = path.resolve(__dirname, '../../frontend');
+if (fs.existsSync(frontendDir)) {
+  console.log(`[FRONTEND] Serving static files from: ${frontendDir}`);
+  app.use(express.static(frontendDir));
+
+  // SPA-style fallback: any non-API GET that doesn't match a file goes to index.html
+  app.get(/^\/(?!api\/).*/, (req, res, next) => {
+    if (req.method === 'GET' && !req.path.startsWith('/api/')) {
+      const indexPath = path.join(frontendDir, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+        return;
+      }
+    }
+    next();
+  });
+} else {
+  console.warn(`[FRONTEND] WARNING: Frontend directory not found at ${frontendDir}`);
+}
+
+// ============================================================================
+// Instance bootstrap endpoint — runs BEFORE the isolation middleware on
+// purpose. Returns the list of valid, configured ServiceNow instances so the
+// frontend can populate its Instance dropdown WITHOUT needing an instanceId
+// of its own. This breaks the chicken-and-egg cycle where the first connection
+// check (which previously defaulted to 'default') would 403 and the frontend
+// would go straight to Standalone Simulation Mode, never learning what
+// instances exist.
+// ============================================================================
+app.get('/api/instances', (req, res) => {
+  const allInstances = instanceRegistry.getAllInstancesWithStatus();
+  const instances = allInstances.map(row => {
+    const meta = instanceRegistry.getInstanceMetadata(row.instanceId);
+    return {
+      instanceId:   row.instanceId,
+      isConfigured: row.isValid,                 // false = misconfigured
+      isValid:      row.isValid,
+      label:        row.instanceId.replace(/^instance_0*/i, 'Instance ')
+                      .replace(/_/g, ' ')
+                      .replace(/\b\w/g, l => l.toUpperCase()),
+      hasUrl:       !!(meta?.hasUrl),            // ✔ = URL env var found
+      hasKey:       !!(meta?.hasKey),            // ✔ = KEY or USERNAME+PASSWORD env vars found
+      error:        row.error || null            // ❌ human-readable error: "Missing URL or credentials..."
+    };
+  });
+  res.json({
+    success: true,
+    count: instances.length,
+    validCount: instances.filter(i => i.isValid).length,
+    invalidCount: instances.filter(i => !i.isValid).length,
+    instances
+  });
+});
+
+// ============================================================================
+// CRITICAL: Instance Isolation Middleware
+// ============================================================================
+// Every request is scoped to a specific instance.
+// ISOLATION GUARANTEE: No data leakage between instances.
+// ============================================================================
+app.use((req, res, next) => {
+  // Extract instanceId from request (body, query, or header)
+  let instanceId = req.body?.instanceId ||
+                   req.query?.instanceId ||
+                   req.get('X-Instance-Id');
+
+  const platform = (req.body?.platform || req.query?.platform || '').toLowerCase().trim();
+  const isSalesforce = platform === 'salesforce' || platform.includes('salesforce') || instanceId === 'salesforce';
+
+  // If request is from Salesforce, isolate it under the 'salesforce' platform context
+  // and do NOT validate against ServiceNow instanceRegistry.
+  if (isSalesforce) {
+    req.instanceId = instanceId || 'salesforce';
+    req.obsService = obsService;
+    req.cacheService = cacheService;
+    console.log(`[ISOLATION] ${req.method} ${req.path} from platform 'salesforce' (instance: '${req.instanceId}')`);
+    return next();
+  }
+
+  const validInstances = instanceRegistry.getValidInstances();
+
+  // If no instanceId provided or 'default' requested, fallback to first valid configured instance
+  if (!instanceId || instanceId === 'default') {
+    instanceId = validInstances.length > 0 ? validInstances[0] : 'instance_001';
+  }
+
+  // ✅ VALIDATION: Verify instance is configured
+  if (!instanceRegistry.isValidInstance(instanceId) && validInstances.length > 0) {
+    console.warn(
+      `[ISOLATION] Access denied: Instance '${instanceId}' not found. ` +
+      `Valid instances: ${validInstances.join(', ')}`
+    );
+
+    return res.status(403).json({
+      success: false,
+      error: `Instance '${instanceId}' not found or not configured.`,
+      availableInstances: validInstances
+    });
+  }
+
+  // ✅ INJECTION: Attach instance context to request
+  req.instanceId = instanceId;
+  req.obsService = obsService;
+  req.cacheService = cacheService;
+
+  // Log request with instance context
+  console.log(
+    `[ISOLATION] ${req.method} ${req.path} from instance '${instanceId}'`
+  );
+
+  next();
+});
+
+// Initialize core client and adapters
+const llmClient = new GeminiLLMClient();
+// Separate client/provider from llmClient above — used ONLY by the
+// verification layer, deliberately never by any producer agent, so the
+// checker can never share the producer's blind spots.
+const groqClient = new GroqLLMClient();
+const deepInfraClient = new DeepInfraLLMClient();
+const embeddingsClient = new GeminiEmbeddingsClient();
+const vectorStore = new VectorStore();
+const universalDiscoveryAgent = new UniversalSchemaDiscoveryAgent(llmClient, embeddingsClient, vectorStore);
+const salesforceAdapter = new SalesforceAdapter();
+
+// Registry of dynamically onboarded platforms (built by UniversalSchemaDiscoveryAgent).
+// Keyed by platformName, so /api/run-agent can route to them alongside the
+// hand-written ServiceNow/Salesforce adapters with zero new adapter code.
+const dynamicAdapters = new Map<string, DynamicAdapter>();
+
+function buildDynamicAdapter(config: GeneratedAdapterConfig): DynamicAdapter {
+  // Only 'salesforce-soql' has a live connection today, so it reuses the
+  // same Salesforce credentials already configured for SalesforceAdapter.
+  return new DynamicAdapter(
+    config,
+    process.env.SALESFORCE_INSTANCE_URL || '',
+    process.env.SALESFORCE_CLIENT_ID || '',
+    process.env.SALESFORCE_CLIENT_SECRET || ''
+  );
+}
+
+// Load any previously generated adapter configs at startup so onboarded
+// platforms survive a server restart.
+for (const config of listAllAdapterConfigs()) {
+  dynamicAdapters.set(config.platformName, buildDynamicAdapter(config));
+  console.log(`[GRC Agnostic Server] Loaded previously generated adapter for platform '${config.platformName}'.`);
+}
+
+// Metadata endpoint
+app.get('/api/platforms', (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  // ✅ ISOLATION: Get instance-specific metadata
+  const instanceMetadata = instanceRegistry.getInstanceMetadata(instanceId);
+
+  const discoveredPlatforms = Array.from(dynamicAdapters.values()).map(a => ({
+    id: a.getPlatformName(),
+    name: `${a.getPlatformName()} (Discovered)`,
+    description: `Onboarded via Universal Schema Discovery Agent — ${a.getEntityLabel()}-scoped GRC data.`
+  }));
+
+  res.json({
+    instanceId, // ✅ Proof of isolation
+    instance: instanceMetadata,
+    platforms: [
+      {
+        id: 'servicenow',
+        name: 'ServiceNow GRC',
+        description: 'Enterprise Risk & Compliance Workspace',
+        isConfigured: instanceMetadata?.isConfigured || false
+      },
+      { id: 'salesforce', name: 'Salesforce GRC (Custom)', description: 'Salesforce Custom GRC Cloud Objects' },
+      ...discoveredPlatforms
+    ],
+    agents: [
+      { id: 'control-effectiveness', name: 'Control Effectiveness Agent', description: 'Batch assesses control effectiveness against test evidence and audit runs.' },
+      { id: 'inherent-assessment', name: 'Inherent Assessment Agent', description: 'Evaluates inherent factors (PII sensitivity, threat model) using guidance rubrics.' },
+      { id: 'risk-control-mapping', name: 'Risk-Control Mapping Agent', description: 'Analyses entity risks and maps relevant mitigating controls from library.' },
+      { id: 'issue-identification', name: 'Issue Identification Agent', description: 'Drafts a tracked issue for a risk, given its sys_id — trigger is external (e.g. a ServiceNow client script), not scan-based.' },
+      { id: 'authority-document-citation', name: 'LRR Obligation Mapping Agent', description: 'Maps authority documents to obligations with semantic matching and priority analysis.' },
+      { id: 'citation-risk-mapping', name: 'Citation to Risk Mapping Agent', description: 'Maps citations/obligations to breachable entity risks with ranked candidate evaluation, gap identification, and over-mapping detection.' },
+      { id: 'obligation-control-objective-mapping', name: 'Obligation-Control Objective Mapping Agent', description: 'Maps obligations to control objectives using a multi-pass evaluation and gap analysis loop.' }
+    ]
+  });
+});
+
+// ----------------------------------------------------------------------------
+// In-Memory Agent Background Job Tracker
+// ----------------------------------------------------------------------------
+interface AgentJob {
+  jobId: string;
+  status: 'running' | 'completed' | 'failed';
+  agent: string;
+  platform: string;
+  targetId: string;
+  instanceId: string;
+  startTime: number;
+  completedTime?: number;
+  result?: any;
+  error?: string;
+  logs: string[];
+}
+const agentJobs = new Map<string, AgentJob>();
+
+// Status polling endpoint for background jobs
+app.get('/api/agent-jobs/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = agentJobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, error: `Job '${jobId}' not found.` });
+  }
+  res.json({
+    success: true,
+    jobId: job.jobId,
+    status: job.status,
+    agent: job.agent,
+    platform: job.platform,
+    targetId: job.targetId,
+    instanceId: job.instanceId,
+    startTime: job.startTime,
+    completedTime: job.completedTime,
+    result: job.result,
+    error: job.error,
+    logs: job.logs
+  });
+});
+
+// Endpoint to run any core GRC agent dynamically
+app.post('/api/run-agent', async (req, res) => {
+  const { platform, agent, targetId } = req.body;
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+  const isSync = req.query.sync === 'true' || req.body.sync === true;
+
+  console.log(`[RUN-AGENT INBOUND] platform='${platform}', agent='${agent}', targetId='${targetId}', instanceId='${instanceId}'`);
+
+  if (!platform || !agent || !targetId) {
+    return res.status(400).json({
+      error: 'Missing parameters platform, agent, or targetId.',
+      instanceId
+    });
+  }
+
+  const normPlatform = (platform || '').toLowerCase().trim();
+  const isHexSysId = /^[0-9a-f]{32}$/i.test(targetId);
+  const isSalesforceId = /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test(targetId);
+
+  if ((normPlatform === 'salesforce' || normPlatform.includes('salesforce')) && isHexSysId) {
+    console.warn(`[RUN-AGENT MISMATCH] ⚠️ Platform is '${platform}' but targetId '${targetId}' is a 32-hex-character ServiceNow sys_id! Verify whether this call was intended for ServiceNow.`);
+  } else if (normPlatform === 'servicenow' && isSalesforceId && !isHexSysId) {
+    console.warn(`[RUN-AGENT MISMATCH] ⚠️ Platform is '${platform}' but targetId '${targetId}' looks like a 15/18-character Salesforce ID! Verify whether this call was intended for Salesforce.`);
+  }
+
+  // ✅ ISOLATION: Select adapter for THIS instance only
+  let adapter: any;
+  try {
+    if (normPlatform === 'servicenow') {
+      adapter = instanceRegistry.getAdapter(instanceId);
+      console.log(`[ISOLATION] Using registered ServiceNow adapter for instance '${instanceId}'`);
+    } else if (normPlatform === 'salesforce' || normPlatform.includes('salesforce')) {
+      adapter = dynamicAdapters.get(platform) || salesforceAdapter;
+      console.log(`[ISOLATION] Using Salesforce adapter for target '${targetId}'`);
+    } else {
+      adapter = dynamicAdapters.get(platform);
+    }
+
+    if (!adapter) {
+      return res.status(400).json({
+        error: `Platform '${platform}' is not supported.`,
+        instanceId
+      });
+    }
+  } catch (error: any) {
+    console.error(`[ISOLATION] Failed to get adapter for instance '${instanceId}': ${error.message}`);
+    const instanceConfigDiagnostics = instanceRegistry.getInstanceMetadata(instanceId)
+      || { instanceId, isConfigured: false, hasUrl: false, hasKey: false };
+    return res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Failed to initialize adapter for instance '${instanceId}': ${error.message}`,
+      instanceId,
+      instanceConfigDiagnostics,
+      instanceList: instanceRegistry.getAllInstancesWithStatus()
+    });
+  }
+
+  if (!['control-effectiveness', 'inherent-assessment', 'risk-control-mapping', 'issue-identification', 'authority-document-citation', 'lrr-obligation-mapping', 'regulatory-decomposition', 'citation-risk-mapping', 'obligation-control-objective-mapping'].includes(agent)) {
+    return res.status(400).json({
+      error: `Unsupported agent action: ${agent}`,
+      instanceId
+    });
+  }
+
+  // ── In-flight deduplication: if the same agent+platform+target is already
+  // running, return the existing jobId instead of spawning a parallel execution.
+  // Root cause of "2 ema audits every run": ServiceNow retries or double-clicks
+  // fire a second POST while the first is still in progress. ──
+  const existingJob = Array.from(agentJobs.values()).find(
+    j => j.status === 'running' &&
+         j.agent === agent &&
+         (j.platform || '').toLowerCase() === normPlatform &&
+         j.targetId === targetId
+  );
+  if (existingJob) {
+    console.log(`[DEDUP] Agent '${agent}' for target '${targetId}' on instance '${instanceId}' is already running (job ${existingJob.jobId}). Returning existing job.`);
+    return res.status(202).json({
+      success: true,
+      status: 'already_running',
+      jobId: existingJob.jobId,
+      message: 'Agent execution already in progress for this target.',
+      agent,
+      platform,
+      targetId,
+      instanceId
+    });
+  }
+
+  // Create tracked background job record
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const jobRecord: AgentJob = {
+    jobId,
+    status: 'running',
+    agent,
+    platform,
+    targetId,
+    instanceId,
+    startTime: Date.now(),
+    logs: []
+  };
+  agentJobs.set(jobId, jobRecord);
+
+  // Clean old jobs (keep last 200)
+  if (agentJobs.size > 200) {
+    const oldestKey = agentJobs.keys().next().value;
+    if (oldestKey) agentJobs.delete(oldestKey);
+  }
+
+  // Execution worker function
+  const runAgentExecution = async (): Promise<any> => {
+    const capturedLogs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: any[]) => {
+      capturedLogs.push(args.join(' '));
+      jobRecord.logs.push(args.join(' '));
+      originalLog(...args);
+    };
+
+    try {
+      const result = await obsService.withTrace(
+        instanceId,
+        'run-agent',
+        async (recordSpan) => {
+          recordSpan('agent-start', { agent, platform, targetId, jobId });
+
+          let agentResult: any;
+          if (agent === 'control-effectiveness') {
+            agentResult = await new ControlEffectivenessAgent(adapter, llmClient).execute(targetId);
+          } else if (agent === 'inherent-assessment') {
+            agentResult = await new InherentAssessmentAgent(adapter, llmClient).execute(targetId);
+          } else if (agent === 'issue-identification') {
+            agentResult = await new IssueIdentificationAgent(adapter, llmClient).execute(targetId);
+          } else if (agent === 'authority-document-citation' || agent === 'lrr-obligation-mapping' || agent === 'regulatory-decomposition') {
+            agentResult = await new AuthorityDocumentCitationAgent(adapter, llmClient).execute(targetId, req.body.options || req.body);
+          } else if (agent === 'citation-risk-mapping') {
+            agentResult = await new CitationRiskMappingAgent(adapter, llmClient).execute(targetId);
+          } else if (agent === 'obligation-control-objective-mapping') {
+            agentResult = await new ObligationControlObjectiveMappingAgent(adapter, llmClient).execute(targetId);
+          } else {
+            agentResult = await new RiskControlMappingAgent(adapter, llmClient).execute(targetId);
+          }
+
+          recordSpan('agent-complete', { agent, platform, jobId });
+          return agentResult;
+        },
+        { platform, agent, targetId, instanceId, jobId }
+      );
+
+      jobRecord.status = 'completed';
+      jobRecord.completedTime = Date.now();
+      jobRecord.result = result;
+
+      // Verification layer — runs automatically after agent completes
+      if (deepInfraClient.isLive()) {
+        new VerificationAgent(adapter, deepInfraClient).verifyAgentRun(agent, targetId, req.body.options || req.body)
+          .then(v => console.log(`[VerificationAgent] Instance '${instanceId}' [${agent}] ${v.success ? 'OK' : 'skipped'}: ${v.message}`))
+          .catch(e => console.warn(`[VerificationAgent] Instance '${instanceId}' [${agent}] Failed: ${e.message}`));
+      }
+
+      return result;
+    } catch (error: any) {
+      jobRecord.status = 'failed';
+      jobRecord.completedTime = Date.now();
+      jobRecord.error = error?.message || 'Unknown error';
+
+      console.error(
+        `\n================================================================================\n` +
+        `  ❌ AGENT EXECUTION FAILED [Job: '${jobId}'] [Instance: '${instanceId}'] [Agent: '${agent}']\n` +
+        `  Target ID: ${targetId}\n` +
+        `  Error: ${error?.message || 'Unknown error'}\n` +
+        `================================================================================\n`
+      );
+      if (error?.stack) {
+        console.error(error.stack);
+      }
+      throw error;
+    } finally {
+      console.log = originalLog;
+    }
+  };
+
+  // Synchronous execution mode (when explicitly requested)
+  if (isSync) {
+    try {
+      const result = await runAgentExecution();
+      const adapterDiagnostics = typeof adapter.getAdapterDiagnostics === 'function'
+        ? adapter.getAdapterDiagnostics()
+        : { instanceId, mode: 'unknown', useLive: null as boolean | null, instanceUrlConfigured: false, authConfigured: false };
+
+      return res.json({
+        success: true,
+        agent,
+        platform,
+        instanceId,
+        jobId,
+        adapterDiagnostics,
+        result,
+        logs: jobRecord.logs
+      });
+    } catch (error: any) {
+      const adapterDiagnostics = adapter && typeof adapter.getAdapterDiagnostics === 'function'
+        ? adapter.getAdapterDiagnostics()
+        : { instanceId, mode: 'unknown', useLive: null as boolean | null, instanceUrlConfigured: false, authConfigured: false };
+      return res.status(500).json({
+        success: false,
+        error: error?.message || 'Agent execution failed',
+        instanceId,
+        jobId,
+        adapterDiagnostics,
+        logs: jobRecord.logs
+      });
+    }
+  }
+
+  // ── Default Asynchronous Execution (Returns 202 immediately) ──
+  // Salesforce callouts time out at 120s (Apex callout timeout default is 30s).
+  // Return 202 Accepted right away, and let execution run in background.
+  res.status(202).json({
+    success: true,
+    status: 'accepted',
+    jobId,
+    message: 'Agent execution started in background.',
+    agent,
+    platform,
+    targetId,
+    instanceId
+  });
+
+  // Background promise execution kept alive by Vercel's waitUntil()
+  const backgroundPromise = runAgentExecution().catch(e => {
+    console.error(`[Background Task ${jobId}] Unhandled failure:`, e?.message || e);
+  });
+
+  try {
+    waitUntil(backgroundPromise);
+  } catch (_) {
+    // Standalone Node runtime handles backgroundPromise in event loop
+  }
+});
+
+// ============================================================================
+// Excel Upload & Bulk Risk-Control Mapping Endpoint
+// ============================================================================
+app.post('/api/map-excel', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No Excel file provided in request.' });
+    }
+
+    console.log(`[API /api/map-excel] Received file '${req.file.originalname}' (${req.file.size} bytes).`);
+
+    const outputBuffer = await processExcelMapping(req.file.buffer, llmClient);
+
+    const filename = `Mapped_${req.file.originalname.replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(outputBuffer);
+  } catch (error: any) {
+    console.error(`[API /api/map-excel] Error mapping Excel file: ${error.message}`, error);
+    return res.status(500).json({
+      success: false,
+      error: `Excel mapping failed: ${error.message}`
+    });
+  }
+});
+
+// ============================================================================
+// AI Observability endpoints (Instance-scoped)
+// ============================================================================
+app.get('/api/observability/traces', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+  const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 100);
+
+  // ✅ ISOLATION: Get traces for THIS instance only
+  const traces = obsService.getTracesForInstance(instanceId, limit);
+  const sanitized = traces.map(t => obsService.sanitizeTraceForResponse(t));
+
+  res.json({
+    success: true,
+    instanceId, // ✅ Proof of isolation
+    traceCount: sanitized.length,
+    traces: sanitized
+  });
+});
+
+app.get('/api/observability/stats', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  // ✅ ISOLATION: Get stats for THIS instance only
+  const stats = obsService.getStatsForInstance(instanceId);
+  const cacheStats = cacheService.getStatsForInstance(instanceId);
+
+  res.json({
+    success: true,
+    instanceId, // ✅ Proof of isolation
+    observability: stats,
+    cache: cacheStats
+  });
+});
+
+// ============================================================================
+// Integrity scan — the async half of the "0 issues" monitoring pair. The
+// synchronous writeVerified() check inside agents.ts catches a bad write the
+// instant it happens; this catches drift (a field that was fine right after
+// the write but got cleared by something else afterward — confirmed possible
+// on this project). Meant to be hit by a scheduler (Vercel Cron, see
+// vercel.json), not a human — gated by a shared secret since it triggers real
+// writes (flagging affected records) against the live platform, same as
+// /api/run-agent.
+// ============================================================================
+app.get('/api/health/integrity-scan', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  // Vercel automatically sends CRON_SECRET as `Authorization: Bearer <value>`
+  // on cron-triggered requests — this is Vercel's own documented mechanism,
+  // not a custom header, so a scheduled invocation authenticates for free.
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    if (req.get('authorization') !== `Bearer ${cronSecret}`) {
+      return res.status(401).json({
+        success: false,
+        error: 'Missing or invalid Authorization header.',
+        instanceId
+      });
+    }
+  } else {
+    console.warn(`[IntegrityScan] Instance '${instanceId}' CRON_SECRET is not set — endpoint is running unauthenticated.`);
+  }
+
+  const sinceHours = Math.min(Math.max(parseInt(String(req.query.sinceHours || '6'), 10) || 6, 1), 72);
+
+  try {
+    // ✅ ISOLATION: Scan instance-specific adapter only
+    const result = await obsService.withTrace(
+      instanceId,
+      'integrity-scan',
+      async (recordSpan) => {
+        recordSpan('scan-start', { sinceHours });
+
+        // ✅ Use registry-managed adapter for THIS instance
+        const servicenowAdapter = instanceRegistry.getAdapter(instanceId);
+        const servicenowResult = await runIntegrityScan(servicenowAdapter, sinceHours);
+
+        recordSpan('scan-complete', {
+          platform: 'servicenow',
+          findings: servicenowResult.findings.length
+        });
+
+        return {
+          ...servicenowResult,
+          adapterDiagnostics: servicenowAdapter.getAdapterDiagnostics()
+        };
+      },
+      {
+        sinceHours,
+        instanceId // ✅ ISOLATION: Tag with instance
+      }
+    );
+
+    res.json({
+      success: true,
+      instanceId, // ✅ Proof of isolation
+      adapterDiagnostics: result.adapterDiagnostics, // ✅ Show live vs mock mode
+      findings: result.findings.length,
+      result
+    });
+  } catch (error: any) {
+    console.error(`[ISOLATION] Instance '${instanceId}' integrity-scan failed: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Integrity scan failed for instance '${instanceId}'`,
+      instanceId
+    });
+  }
+});
+
+// Endpoint to list all available risks from ServiceNow (live or mock)
+app.get('/api/platforms/servicenow/risks', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  try {
+    // ✅ ISOLATION: Use registry-managed adapter for THIS instance
+    const adapter = instanceRegistry.getAdapter(instanceId);
+    const risks = await adapter.getAllRisks();
+    const adapterDiagnostics = adapter.getAdapterDiagnostics();
+
+    res.json({
+      success: true,
+      instanceId, // ✅ Proof of isolation
+      adapterDiagnostics, // ✅ Show live vs mock mode
+      risks
+    });
+  } catch (error: any) {
+    console.error(`[ISOLATION] Instance '${instanceId}' risks fetch failed: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Failed to fetch risks for instance '${instanceId}'`,
+      instanceId
+    });
+  }
+});
+
+// Endpoint to list all assessment instances from ServiceNow (live or mock)
+app.get('/api/platforms/servicenow/assessments', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  try {
+    // ✅ ISOLATION: Use registry-managed adapter for THIS instance
+    const adapter = instanceRegistry.getAdapter(instanceId);
+    const agentFilter = req.query.agent ? String(req.query.agent) : undefined;
+    const instances = await adapter.getAllAssessmentInstances(agentFilter);
+    const adapterDiagnostics = adapter.getAdapterDiagnostics();
+
+    res.json({
+      success: true,
+      instanceId, // ✅ Proof of isolation
+      adapterDiagnostics, // ✅ Show live vs mock mode
+      useLive: adapterDiagnostics.useLive,
+      instances
+    });
+  } catch (error: any) {
+    console.error(`[ISOLATION] Instance '${instanceId}' assessments fetch failed: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Failed to fetch assessments for instance '${instanceId}'`,
+      instanceId
+    });
+  }
+});
+
+// Endpoint to list all authority documents from ServiceNow (for LRR Obligations Agent)
+app.get('/api/platforms/servicenow/authority-documents', async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  try {
+    // ✅ ISOLATION: Use registry-managed adapter for THIS instance
+    const adapter = instanceRegistry.getAdapter(instanceId);
+    const documents = await adapter.getAllAuthorityDocuments();
+    const adapterDiagnostics = adapter.getAdapterDiagnostics();
+
+    res.json({
+      success: true,
+      instanceId, // ✅ Proof of isolation
+      adapterDiagnostics, // ✅ Show live vs mock mode
+      useLive: adapterDiagnostics.useLive,
+      documents
+    });
+  } catch (error: any) {
+    console.error(`[ISOLATION] Instance '${instanceId}' authority documents fetch failed: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Failed to fetch authority documents for instance '${instanceId}'`,
+      instanceId
+    });
+  }
+});
+
+// Endpoint to list all citations / obligations from ServiceNow (for Citation to Risk Mapping Agent)
+app.get(['/api/platforms/servicenow/citations', '/api/platforms/servicenow/obligations'], async (req, res) => {
+  const instanceId = req.instanceId; // ✅ From isolation middleware
+
+  try {
+    const adapter = instanceRegistry.getAdapter(instanceId);
+    const citations = await (adapter as any).getAllObligations?.() || [];
+    const adapterDiagnostics = adapter.getAdapterDiagnostics();
+
+    res.json({
+      success: true,
+      instanceId,
+      adapterDiagnostics,
+      useLive: adapterDiagnostics.useLive,
+      citations
+    });
+  } catch (error: any) {
+    console.error(`[ISOLATION] Instance '${instanceId}' citations fetch failed: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: `[ISOLATION] Failed to fetch citations for instance '${instanceId}'`,
+      instanceId
+    });
+  }
+});
+
+// Endpoint to list all available risks from Salesforce (live or mock)
+app.get('/api/platforms/salesforce/risks', async (req, res) => {
+  try {
+    const risks = await salesforceAdapter.getAllRisks();
+    res.json({ success: true, risks });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint to list all assessment instances from Salesforce (live or mock)
+app.get('/api/platforms/salesforce/assessments', async (req, res) => {
+  try {
+    const agent = req.query.agent as string;
+    const instances = await salesforceAdapter.getAllAssessmentInstances(agent);
+    res.json({ success: true, instances });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint to list all authority documents from Salesforce (live or mock)
+app.get('/api/platforms/salesforce/authority-documents', async (req, res) => {
+  try {
+    const documents = await (salesforceAdapter as any).getAllAuthorityDocuments?.() || [];
+    res.json({ success: true, documents });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint to list all citations from Salesforce (live or mock)
+app.get('/api/platforms/salesforce/citations', async (req, res) => {
+  try {
+    const citations = await (salesforceAdapter as any).getAllObligations?.() || [];
+    res.json({ success: true, citations });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint to parse new platform schemas from pasted metadata text (no live connection required)
+app.post('/api/schema-discovery', async (req, res) => {
+  const { rawMetadata, platformName } = req.body;
+  if (!rawMetadata) {
+    return res.status(400).json({ error: 'Missing parameter rawMetadata.' });
+  }
+
+  try {
+    const result = await universalDiscoveryAgent.executeFromPastedMetadata(platformName || 'Custom GRC Platform', rawMetadata);
+    res.json({
+      success: true,
+      result
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Endpoint to onboard a new platform via LIVE schema introspection + vector matching.
+// Today only Salesforce orgs are supported as a live connection type — the
+// pipeline reuses the same SALESFORCE_* credentials already configured for
+// the hand-written SalesforceAdapter.
+app.post('/api/schema-discovery/live', async (req, res) => {
+  const { platformName, entityLabel } = req.body;
+  if (!platformName) {
+    return res.status(400).json({ error: 'Missing parameter platformName.' });
+  }
+
+  const instanceUrl = process.env.SALESFORCE_INSTANCE_URL || '';
+  const clientId = process.env.SALESFORCE_CLIENT_ID || '';
+  const clientSecret = process.env.SALESFORCE_CLIENT_SECRET || '';
+  const connector = new SalesforceDescribeConnector(instanceUrl, clientId, clientSecret);
+
+  if (!connector.isConfigured()) {
+    return res.status(400).json({ error: 'Live discovery requires SALESFORCE_INSTANCE_URL, SALESFORCE_CLIENT_ID and SALESFORCE_CLIENT_SECRET to be configured in .env.' });
+  }
+
+  const logs: string[] = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args: any[]) => { logs.push(args.join(' ')); originalLog(...args); };
+  console.warn = (...args: any[]) => { logs.push(args.join(' ')); originalWarn(...args); };
+
+  try {
+    const config = await withTrace('schema-discovery', { platformName }, () =>
+      universalDiscoveryAgent.executeLive(platformName, connector, 'salesforce-soql', entityLabel)
+    );
+    dynamicAdapters.set(config.platformName, buildDynamicAdapter(config));
+
+    console.log = originalLog;
+    console.warn = originalWarn;
+    res.json({ success: true, config, logs });
+  } catch (error: any) {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    res.status(500).json({ success: false, error: error.message, logs });
+  }
+});
+
+// Purpose-based candidate ranking (fast — no LLM confirmation pass).
+// Ranks every queryable object in the connected Salesforce org by semantic
+// similarity to the gold-standard table purposes learned from the
+// hand-written adapters, and returns the top matches with scores.
+app.get('/api/schema-discovery/candidates', async (req, res) => {
+  const connector = new SalesforceDescribeConnector(
+    process.env.SALESFORCE_INSTANCE_URL || '',
+    process.env.SALESFORCE_CLIENT_ID || '',
+    process.env.SALESFORCE_CLIENT_SECRET || ''
+  );
+  if (!connector.isConfigured()) {
+    return res.status(400).json({ success: false, error: 'Salesforce credentials not configured in .env.' });
+  }
+  try {
+    const topK = parseInt(String(req.query.topK || '15'), 10);
+    const candidates = await universalDiscoveryAgent.rankCandidateObjects(connector, topK);
+    res.json({ success: true, semantic: embeddingsClient.isLive(), candidates });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Lists platforms onboarded via the Universal Schema Discovery agent
+app.get('/api/platforms/discovered', (req, res) => {
+  res.json({
+    success: true,
+    platforms: Array.from(dynamicAdapters.values()).map(a => ({
+      platformName: a.getPlatformName(),
+      entityLabel: a.getEntityLabel()
+    })),
+    configs: listAllAdapterConfigs()
+  });
+});
+
+// Generic risk/assessment listing for dynamically onboarded platforms
+app.get('/api/platforms/:platformName/risks', async (req, res) => {
+  const adapter = dynamicAdapters.get(req.params.platformName);
+  if (!adapter) return res.status(404).json({ success: false, error: `No discovered platform named '${req.params.platformName}'.` });
+  try {
+    const risks = await adapter.getAllRisks();
+    res.json({ success: true, risks });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/platforms/:platformName/assessments', async (req, res) => {
+  const adapter = dynamicAdapters.get(req.params.platformName);
+  if (!adapter) return res.status(404).json({ success: false, error: `No discovered platform named '${req.params.platformName}'.` });
+  try {
+    const agent = req.query.agent as string;
+    const instances = await adapter.getAllAssessmentInstances(agent);
+    res.json({ success: true, instances });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/platforms/:platformName/authority-documents', async (req, res) => {
+  const adapter = dynamicAdapters.get(req.params.platformName);
+  if (!adapter) return res.status(404).json({ success: false, error: `No discovered platform named '${req.params.platformName}'.` });
+  try {
+    const documents = await (adapter as any).getAllAuthorityDocuments?.() || [];
+    res.json({ success: true, documents });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/platforms/:platformName/citations', async (req, res) => {
+  const adapter = dynamicAdapters.get(req.params.platformName);
+  if (!adapter) return res.status(404).json({ success: false, error: `No discovered platform named '${req.params.platformName}'.` });
+  try {
+    const citations = await (adapter as any).getAllObligations?.() || [];
+    res.json({ success: true, citations });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// Export for Vercel (and other serverless runtimes) which import the app
+// directly without calling listen(). Local Express dev still calls listen().
+// Diagnostic endpoint: describe any Salesforce object by name
+// Usage: GET /api/debug/salesforce/describe/Ema_Audit_Trail__c
+app.get('/api/debug/salesforce/describe/:objectName', async (req, res) => {
+  try {
+    const { objectName } = req.params;
+
+    // Use the Salesforce adapter to query the describe API
+    const token = (salesforceAdapter as any).getAccessToken ?
+      await (salesforceAdapter as any).getAccessToken() :
+      null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Salesforce credentials not configured' });
+    }
+
+    const instanceUrl = (salesforceAdapter as any).instanceUrl;
+
+    const response = await axios.get(
+      `${instanceUrl}/services/data/v60.0/sobjects/${objectName}/describe`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    const describe = response.data;
+
+    // Return simplified field list
+    const fields = (describe as any).fields.map((f: any) => ({
+      name: f.name,
+      label: f.label,
+      type: f.type,
+      updateable: f.updateable,
+      createable: f.createable,
+      length: f.length,
+      custom: f.custom
+    }));
+
+    res.json({
+      objectName,
+      totalFields: fields.length,
+      fields
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// Catch-all handler for unmatched API requests. Explains *exactly* what went
+// wrong so when a ServiceNow Script Include calls the wrong method/path, the
+// error message (and server log) is actionable instead of a mysterious 404.
+// ============================================================================
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) {
+    return next();
+  }
+
+  // Compute which methods ARE available for this path.
+  // Exact matches first, then parameterized patterns that Express normally
+  // handles automatically (e.g. /api/platforms/servicenow/risks matches the
+  // pattern /api/platforms/:platformName/risks).
+  const methodTable: Record<string, string[]> = {
+    '/api/instances': ['GET'],
+    '/api/platforms': ['GET'],
+    '/api/run-agent': ['POST'],
+    '/api/map-excel': ['POST'],
+    '/api/observability/traces': ['GET'],
+    '/api/observability/stats': ['GET'],
+    '/api/health/integrity-scan': ['GET'],
+    '/api/platforms/servicenow/risks': ['GET'],
+    '/api/platforms/servicenow/assessments': ['GET'],
+    '/api/platforms/servicenow/authority-documents': ['GET'],
+    '/api/platforms/servicenow/citations': ['GET'],
+    '/api/platforms/servicenow/obligations': ['GET'],
+    '/api/platforms/salesforce/risks': ['GET'],
+    '/api/platforms/salesforce/assessments': ['GET'],
+    '/api/platforms/salesforce/authority-documents': ['GET'],
+    '/api/platforms/salesforce/citations': ['GET'],
+    '/api/schema-discovery': ['POST'],
+    '/api/schema-discovery/live': ['POST'],
+    '/api/schema-discovery/candidates': ['GET'],
+    '/api/platforms/discovered': ['GET'],
+  };
+  const parameterPatterns: { pattern: RegExp; methods: string[] }[] = [
+    { pattern: /^\/api\/platforms\/[^\/]+\/risks$/, methods: ['GET'] },
+    { pattern: /^\/api\/platforms\/[^\/]+\/assessments$/, methods: ['GET'] },
+    { pattern: /^\/api\/platforms\/[^\/]+\/authority-documents$/, methods: ['GET'] },
+    { pattern: /^\/api\/platforms\/[^\/]+\/citations$/, methods: ['GET'] },
+    { pattern: /^\/api\/platforms\/[^\/]+\/obligations$/, methods: ['GET'] },
+    { pattern: /^\/api\/debug\/salesforce\/describe\/[^\/]+$/, methods: ['GET'] },
+    { pattern: /^\/api\/agent-jobs\/[^\/]+$/, methods: ['GET'] }
+  ];
+
+  let allowed = methodTable[req.path];
+  if (!allowed) {
+    const hit = parameterPatterns.find(p => p.pattern.test(req.path));
+    if (hit) allowed = hit.methods;
+  }
+
+  if (allowed && !allowed.includes(req.method)) {
+    // ---- 405 METHOD NOT ALLOWED -----------------------------------------
+    console.warn(
+      `[405] ${req.method} ${req.path} — allowed methods: ${allowed.join(', ')}`
+    );
+    res.set('Allow', allowed.join(', '));
+    return res.status(405).json({
+      success: false,
+      error: `HTTP 405: Method '${req.method}' not allowed on '${req.path}'. Allowed: ${allowed.join(', ')}`,
+      troubleshooting: [
+        `If you are calling from a ServiceNow Script Include:`,
+        `  → /api/run-agent requires POST (not GET), setHttpMethod('POST')`,
+        `  → All GET endpoints require: ?instanceId=instance_001 (or instance_002)`,
+        `  → All POST bodies require JSON key "instanceId": "instance_001"`,
+        `  → Always set Content-Type: application/json via setRequestHeader('Content-Type','application/json')`
+      ].join('\n')
+    });
+  }
+
+  // ---- 404 PATH NOT FOUND --------------------------------------------
+  console.warn(`[404] ${req.method} ${req.path} — no route matches`);
+  return res.status(404).json({
+    success: false,
+    error: `HTTP 404: No route '${req.method} ${req.path}' exists on this server.`,
+    availableEndpoints: methodTable
+  });
+});
+
+export default app;
+
+// Server bootup — skipped on Vercel, Netlify, and Lambda where the platform invokes the handler directly
+if (!process.env.VERCEL && !process.env.NETLIFY && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  app.listen(PORT, () => {
+    console.log(`[GRC Agnostic Server] Listening on http://localhost:${PORT}`);
+  });
+}
+

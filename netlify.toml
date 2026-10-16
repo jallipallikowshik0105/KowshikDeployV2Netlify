@@ -1,0 +1,33 @@
+[build]
+  publish = "frontend"
+  functions = "netlify/functions"
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = [
+    "express",
+    "serverless-http",
+    "xlsx"
+  ]
+  included_files = [
+    "agents.md",
+    "skills.md",
+    "backend/dist/**"
+  ]
+
+# Route all /api/* requests directly to our Netlify Express function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# Static frontend fallback for SPA routing
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
